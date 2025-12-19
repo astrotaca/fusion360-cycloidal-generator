@@ -34,14 +34,25 @@ def _rot_xy(x, y, ang_rad):
 def _add_circle(sk, cx_mm, cy_mm, r_mm):
     return sk.sketchCurves.sketchCircles.addByCenterRadius(_p3(cx_mm, cy_mm), _mm_to_cm(r_mm))
 
-def _add_poly(sk, pts_mm):
+def _add_spline(sk, pts_mm, close=True, fix=True):
+    """
+    Draws a single fitted spline through all points.
+    Much lighter for Fusion than polylines.
+    """
     sk.isComputeDeferred = True
     try:
-        lines = sk.sketchCurves.sketchLines
-        fusion_pts = [_p3(x, y) for (x, y) in pts_mm]
-        for i in range(len(fusion_pts) - 1):
-            lines.addByTwoPoints(fusion_pts[i], fusion_pts[i + 1])
-        lines.addByTwoPoints(fusion_pts[-1], fusion_pts[0])
+        coll = adsk.core.ObjectCollection.create()
+        for (x, y) in pts_mm:
+            coll.add(_p3(x, y))
+
+        spline = sk.sketchCurves.sketchFittedSplines.add(coll)
+
+        if close:
+            spline.isClosed = True
+        if fix:
+            spline.isFixed = True
+
+        return spline
     finally:
         sk.isComputeDeferred = False
 
@@ -72,22 +83,17 @@ def _validate(N_ring, ring_pcd_mm, pin_diam_mm, ecc_mm, clearance_mm):
     return True, ""
 
 def _trochoid_parallel_points(N_ring, ring_pcd_mm, ecc_mm, d_eff_mm, pts_per_tooth):
-    """
-    Robust trochoid + offset generation.
-    Prevents long straight segments that break the profile at high ratios.
-    """
     R = ring_pcd_mm / 2.0
     lobes = N_ring - 1
 
-    # Base sampling scaled with ratio
-    base_steps = max(240, lobes * int(pts_per_tooth))
-    scale = max(1, int(N_ring / 8))
-    steps = base_steps * scale
+    # SIMPLE, UNIFORM SAMPLING (fast & predictable)
+    steps = max(240, lobes * pts_per_tooth)
 
-    # Max allowed distance between consecutive points (mm)
-    max_segment = 0.25
+    pts = []
 
-    def eval_point(p):
+    for i in range(steps + 1):
+        p = 2.0 * math.pi * i / steps
+
         xa = R * math.cos(p) - ecc_mm * math.cos(N_ring * p)
         ya = R * math.sin(p) - ecc_mm * math.sin(N_ring * p)
 
@@ -95,60 +101,16 @@ def _trochoid_parallel_points(N_ring, ring_pcd_mm, ecc_mm, d_eff_mm, pts_per_too
         dya =  R * math.cos(p) - (ecc_mm * N_ring) * math.cos(N_ring * p)
 
         s = math.hypot(dxa, dya)
-        if s < 1e-12:
-            return None
+        if s < 1e-9:
+            continue
 
-        return (
-            xa - d_eff_mm * (dya / s),
-            ya + d_eff_mm * (dxa / s)
-        )
+        x = xa - d_eff_mm * (dya / s)
+        y = ya + d_eff_mm * (dxa / s)
 
-    def subdivide(p0, p1, pt0, pt1, out, depth=0):
-        if pt0 is None or pt1 is None:
-            return
+        pts.append((x, y))
 
-        dx = pt1[0] - pt0[0]
-        dy = pt1[1] - pt0[1]
-        dist = math.hypot(dx, dy)
+    return pts
 
-        if dist > max_segment and depth < 12:
-            pm = 0.5 * (p0 + p1)
-            ptm = eval_point(pm)
-            subdivide(p0, pm, pt0, ptm, out, depth + 1)
-            subdivide(pm, p1, ptm, pt1, out, depth + 1)
-        else:
-            out.append(pt1)
-
-    pts = []
-
-    p_start = 0.0
-    p_end = 2.0 * math.pi
-
-    prev_p = p_start
-    prev_pt = eval_point(prev_p)
-    if prev_pt is None:
-        prev_pt = eval_point(1e-6)
-
-    pts.append(prev_pt)
-
-    for i in range(1, steps + 1):
-        p = p_end * i / steps
-        pt = eval_point(p)
-        subdivide(prev_p, p, prev_pt, pt, pts)
-        prev_p = p
-        prev_pt = pt
-
-    pts_final = []
-    for p in pts:
-        if not pts_final:
-            pts_final.append(p)
-        else:
-            dx = p[0] - pts_final[-1][0]
-            dy = p[1] - pts_final[-1][1]
-            if dx*dx + dy*dy > 1e-12:
-                pts_final.append(p)
-
-    return pts_final
 
 def _hole_pattern_local(n_holes, hole_pcd_mm):
     r = hole_pcd_mm / 2.0
@@ -159,109 +121,39 @@ def _hole_pattern_local(n_holes, hole_pcd_mm):
     return pts
 
 def _build_disc(sk, profile_world_pts, disc_center_mm, hole_centers_local, hole_rad_mm, center_bore_rad_mm):
-    _add_poly(sk, profile_world_pts)
+    # Draw cycloidal profile as ONE spline (Fusion-friendly)
+    _add_spline(sk, profile_world_pts, close=True, fix=True)
+
+    # Center bore
     _add_circle(sk, disc_center_mm[0], disc_center_mm[1], center_bore_rad_mm)
+
+    # Output holes
     for (hx, hy) in hole_centers_local:
-        _add_circle(sk, disc_center_mm[0] + hx, disc_center_mm[1] + hy, hole_rad_mm)
+        _add_circle(
+            sk,
+            disc_center_mm[0] + hx,
+            disc_center_mm[1] + hy,
+            hole_rad_mm
+        )
+
 
 def _computed_phase_deg(N_ring):
     lobes = N_ring - 1
     return 180.0 / lobes if lobes > 0 else 0.0
 
-def _seg_intersect(a, b, c, d, eps=1e-12):
-    def orient(p, q, r):
-        return (q[0]-p[0])*(r[1]-p[1]) - (q[1]-p[1])*(r[0]-p[0])
+def _generate_profile_no_overlap(
+    N, ring_pcd, ring_pin_d, ecc, clearance_mm, pts_per_tooth
+):
 
-    def on_seg(p, q, r):
-        return (min(p[0], r[0]) - eps <= q[0] <= max(p[0], r[0]) + eps and
-                min(p[1], r[1]) - eps <= q[1] <= max(p[1], r[1]) + eps)
-
-    o1 = orient(a, b, c)
-    o2 = orient(a, b, d)
-    o3 = orient(c, d, a)
-    o4 = orient(c, d, b)
-
-    if (o1 > eps and o2 < -eps or o1 < -eps and o2 > eps) and (o3 > eps and o4 < -eps or o3 < -eps and o4 > eps):
-        return True
-
-    if abs(o1) <= eps and on_seg(a, c, b): return True
-    if abs(o2) <= eps and on_seg(a, d, b): return True
-    if abs(o3) <= eps and on_seg(c, a, d): return True
-    if abs(o4) <= eps and on_seg(c, b, d): return True
-
-    return False
-
-def _polyline_self_intersects(pts):
-    n = len(pts)
-    if n < 6:
-        return False
-
-    for i in range(n):
-        a = pts[i]
-        b = pts[(i+1) % n]
-        for j in range(i+1, n):
-
-            if j == i: 
-                continue
-            if (j == (i+1) % n) or ((i == (j+1) % n)):
-                continue
-
-            c = pts[j]
-            d = pts[(j+1) % n]
-
-            if a == c or a == d or b == c or b == d:
-                continue
-
-            if _seg_intersect(a, b, c, d):
-                return True
-    return False
-
-def _min_gap_to_ring_pins(profile_world_pts, N_ring, ring_pcd_mm, ring_pin_r_mm):
-    R = ring_pcd_mm / 2.0
-    min_gap = 1e9
-
-    for (x, y) in profile_world_pts:
-        for i in range(N_ring):
-            a = 2.0 * math.pi * i / N_ring
-            cx = R * math.cos(a)
-            cy = R * math.sin(a)
-            d = math.hypot(x - cx, y - cy) - ring_pin_r_mm
-            if d < min_gap:
-                min_gap = d
-    return min_gap
-
-def _generate_profile_no_overlap(N, ring_pcd, ring_pin_d, ecc, clearance_mm, pts_per_tooth, exact_geometry):
-    """
-    Returns (base_pts_local, used_guard_mm, min_gap_mm, self_intersects_bool)
-
-    base_pts_local are in disc-local coordinates (to be shifted by disc center later).
-    """
     pin_r = ring_pin_d / 2.0
+    d_eff = pin_r + max(0.0, clearance_mm)
 
-    guard = 0.0
-    step = 0.0
-    max_guard = 0.0
+    base_pts = _trochoid_parallel_points(
+        N, ring_pcd, ecc, d_eff, pts_per_tooth
+    )
 
-    wanted_min_gap = 0.0 if exact_geometry else 0.02  # mm
-
-    last_pts = None
-    last_gap = None
-    last_self = None
-
-    while True:
-        d_eff = pin_r + max(0.0, clearance_mm) + guard
-        base_pts = _trochoid_parallel_points(N, ring_pcd, ecc, d_eff, pts_per_tooth)
-
-        # disc center is at (ecc, 0) in world for Disc1 during sketching
-        c1 = (ecc, 0.0)
-        profile_world = [(x + c1[0], y + c1[1]) for (x, y) in base_pts]
-
-        self_int = _polyline_self_intersects(profile_world)
-        min_gap = _min_gap_to_ring_pins(profile_world, N, ring_pcd, pin_r)
-
-        last_pts, last_gap, last_self = base_pts, min_gap, self_int
-
-        return base_pts, 0.0, min_gap, self_int
+    # Old behavior: no validation, no retries
+    return base_pts, 0.0, 0.0, False
 
 # Main generation
 def _generate(design, opts):
@@ -274,7 +166,6 @@ def _generate(design, opts):
     ecc = float(opts["ecc"])
 
     clearance = float(opts["profile_offset"])
-    exact_geometry = bool(opts.get("exact_geometry", False))
 
     out_n = int(opts["out_n"])
     out_pin_d = float(opts["out_pin_d"])
@@ -289,7 +180,6 @@ def _generate(design, opts):
 
     dual = bool(opts["dual"])
     opposed = bool(opts["opposed"])
-    same_holes_world = bool(opts["same_holes_world"])
 
     phase_deg = opts["phase_deg"]  # None = auto
     if phase_deg is None:
@@ -310,7 +200,7 @@ def _generate(design, opts):
             a = 2.0 * math.pi * i / N
             _add_circle(sk_ring, R * math.cos(a), R * math.sin(a), rr)
 
-    # Output pins (WORLD, fixed)
+    # Output pins
     if draw_outpins:
         sk_out = sketches.add(root.xYConstructionPlane)
         sk_out.name = f"{prefix}_OutputPins"
@@ -320,14 +210,12 @@ def _generate(design, opts):
             a = 2.0 * math.pi * i / out_n
             _add_circle(sk_out, pr * math.cos(a), pr * math.sin(a), rr)
 
-    # Profile generation (NO-OVERLAP default)
     ok, msg = _validate(N, ring_pcd, ring_pin_d, ecc, clearance)
     if not ok:
         raise RuntimeError(msg)
 
-    # Use the robust generator that increases guard until the profile is valid in Fusion
-    base_pts, used_guard, min_gap, self_int = _generate_profile_no_overlap(
-        N, ring_pcd, ring_pin_d, ecc, clearance, pts_per_tooth, exact_geometry
+    base_pts, _, _, _ = _generate_profile_no_overlap(
+        N, ring_pcd, ring_pin_d, ecc, clearance, pts_per_tooth
     )
 
     # Hole & bore sizing
@@ -369,22 +257,29 @@ def _generate(design, opts):
 # UI
 def _update_ui(ins):
     try:
-        N = int(ins.itemById("N_ring").value)
-        auto_on = bool(ins.itemById("auto_phase").value)
+        auto_phase = bool(ins.itemById("auto_phase").value)
+        manual_N = bool(ins.itemById("manual_N").value)
+
+        N_input = ins.itemById("N_ring")
+        ratio_input = ins.itemById("reduction_ratio")
+
+        if not manual_N:
+            ratio = int(ratio_input.value)
+            N_input.value = ratio + 1
 
         manual = ins.itemById("phase_deg_manual")
         readout = ins.itemById("phase_readout")
 
-        manual.isVisible = (not auto_on)
-        readout.isVisible = auto_on
+        manual.isVisible = (not auto_phase)
+        readout.isVisible = auto_phase
 
-        if auto_on:
-            readout.text = f"Auto: {_computed_phase_deg(N):.2f}°"
+        if auto_phase:
+            readout.text = f"Auto: {_computed_phase_deg(int(N_input.value)):.2f}°"
         else:
-            ph_rad = manual.value
-            readout.text = f"Manual: {math.degrees(ph_rad):.2f}°"
+            readout.text = f"Manual: {math.degrees(manual.value):.2f}°"
     except:
         pass
+
 
 def _update_status(ins):
     try:
@@ -393,27 +288,26 @@ def _update_status(ins):
         ring_pin_d = _cm_to_mm(ins.itemById("ring_pin_d").value)
         ecc = _cm_to_mm(ins.itemById("ecc").value)
         clearance = _cm_to_mm(ins.itemById("profile_offset").value)
-        exact = bool(ins.itemById("exact_geometry").value)
 
         ok, msg = _validate(N, ring_pcd, ring_pin_d, ecc, max(0.0, clearance))
 
         lobes = N - 1
+        ratio = lobes
 
         auto_phase = bool(ins.itemById("auto_phase").value)
         phase_deg = _computed_phase_deg(N) if auto_phase else math.degrees(ins.itemById("phase_deg_manual").value)
 
         # Estimate disc diameter (rough): ring radius + ecc + effective roller radius
         pin_r = ring_pin_d / 2.0
-        d_eff_est = pin_r + max(0.0, clearance) + (0.0 if exact else 0.02)
+        d_eff_est = pin_r + max(0.0, clearance)
         approx_dia = 2.0 * ((ring_pcd / 2.0) + ecc + max(0.0, d_eff_est))
 
         st = ins.itemById("status")
-        mode = "Exact" if exact else "Fusion-safe"
 
         if ok:
             st.text = (
-                f"OK ({mode})\n"
-                f"Ratio: {lobes}:1 | Lobes: {lobes} | Phase: {phase_deg:.2f}°\n"
+                "OK\n"
+                f"Ratio: {ratio}:1 | Lobes: {lobes} | Phase: {phase_deg:.2f}°\n"
                 f"E: {ecc:.3f} mm | Pin Ø: {ring_pin_d:.3f} mm\n"
                 f"Roller clearance: {max(0.0, clearance):.3f} mm | Est. disc Ø: ~{approx_dia:.1f} mm"
             )
@@ -445,6 +339,18 @@ class _OnCreate(adsk.core.CommandCreatedEventHandler):
             ins.addTextBoxCommandInput("status", "Status", "", 5, True)
             ins.addTextBoxCommandInput("status_spacer", "", "\n", 1, True)
 
+            ins.addIntegerSpinnerCommandInput(
+                "reduction_ratio",
+                "Reduction ratio (X:1)",
+                2, 100, 1, 8
+            )
+
+            ins.addBoolValueInput(
+                "manual_N",
+                "Manually set ring pins (N)",
+                True, "", False
+            )
+
             ins.addIntegerSpinnerCommandInput("N_ring", "Ring pins (N)", 3, 60, 1, 9)
             ins.addValueInput("ring_pcd", "Ring pin PCD", "mm", adsk.core.ValueInput.createByString("76 mm"))
             ins.addValueInput("ring_pin_d", "Ring pin diameter", "mm", adsk.core.ValueInput.createByString("6 mm"))
@@ -457,13 +363,7 @@ class _OnCreate(adsk.core.CommandCreatedEventHandler):
                 adsk.core.ValueInput.createByString("0.10 mm")
             )
 
-            ins.addBoolValueInput(
-                "exact_geometry",
-                "Exact geometry (can be tangent / may be annoying in Fusion)",
-                True, "", False
-            )
-
-            ins.addIntegerSpinnerCommandInput("pts_per_tooth", "Points per lobe", 40, 600, 10, 120)
+            ins.addIntegerSpinnerCommandInput("pts_per_tooth", "Points per lobe", 10, 80, 5, 30)
 
             ins.addIntegerSpinnerCommandInput("out_n", "Output pin count", 1, 60, 1, 9)
             ins.addValueInput("out_pin_d", "Output pin diameter", "mm", adsk.core.ValueInput.createByString("4 mm"))
@@ -477,8 +377,6 @@ class _OnCreate(adsk.core.CommandCreatedEventHandler):
 
             ins.addBoolValueInput("dual", "Create Disc2", True, "", True)
             ins.addBoolValueInput("opposed", "Disc2 opposite eccentric", True, "", True)
-
-            ins.addBoolValueInput("same_holes_world", "Identical hole positions on both discs", True, "", True)
 
             ins.addBoolValueInput("auto_phase", "Auto phase (180° / lobes)", True, "", True)
             ins.addValueInput("phase_deg_manual", "Manual phase (deg)", "deg", adsk.core.ValueInput.createByString("22.5 deg"))
@@ -525,12 +423,19 @@ class _OnExecute(adsk.core.CommandEventHandler):
             design = adsk.fusion.Design.cast(app.activeProduct)
             ins = args.firingEvent.sender.commandInputs
 
-            N = int(ins.itemById("N_ring").value)
+            
+            manual_N = bool(ins.itemById("manual_N").value)
+
+            if manual_N:
+                N = int(ins.itemById("N_ring").value)
+            else:
+                ratio = int(ins.itemById("reduction_ratio").value)
+                N = ratio + 1
+
             ring_pcd = _cm_to_mm(ins.itemById("ring_pcd").value)
             ring_pin_d = _cm_to_mm(ins.itemById("ring_pin_d").value)
             ecc = _cm_to_mm(ins.itemById("ecc").value)
             clearance = max(0.0, _cm_to_mm(ins.itemById("profile_offset").value))
-            exact = bool(ins.itemById("exact_geometry").value)
 
             ok, msg = _validate(N, ring_pcd, ring_pin_d, ecc, clearance)
             if not ok:
@@ -550,7 +455,6 @@ class _OnExecute(adsk.core.CommandEventHandler):
 
             dual = bool(ins.itemById("dual").value)
             opposed = bool(ins.itemById("opposed").value)
-            same_holes_world = bool(ins.itemById("same_holes_world").value)
 
             auto_phase = bool(ins.itemById("auto_phase").value)
             if auto_phase:
@@ -563,8 +467,7 @@ class _OnExecute(adsk.core.CommandEventHandler):
                 ring_pcd=ring_pcd,
                 ring_pin_d=ring_pin_d,
                 ecc=ecc,
-                profile_offset=clearance,           # treated as clearance (positive)
-                exact_geometry=exact,
+                profile_offset=clearance,
 
                 pts_per_tooth=pts_per_tooth,
                 out_n=out_n,
@@ -577,9 +480,9 @@ class _OnExecute(adsk.core.CommandEventHandler):
                 draw_outpins=draw_outpins,
                 dual=dual,
                 opposed=opposed,
-                same_holes_world=same_holes_world,
                 phase_deg=phase_deg
             )
+
 
             _generate(design, opts)
             ui.messageBox("Done.")

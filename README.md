@@ -19,4 +19,5 @@ This is mainly due to dense curve sampling and adaptive subdivision used to keep
 
 This is a practical tool, not a polished product. Feel free to give feedback or tweak it to your needs.
 
-<img src="examplesketch.png" width="250">
+<img src="examplesketch.png" width="400">
+

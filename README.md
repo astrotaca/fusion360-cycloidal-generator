@@ -21,8 +21,3 @@ Reduction follows the usual rule:
 Ratio = N − 1, where N is the number of ring pins.
 
 This is a practical tool, not a polished product
-
-<img src="examplesketch.png" width="400">
-
-
-
